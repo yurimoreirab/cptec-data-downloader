@@ -1,3 +1,5 @@
+import io
+
 import requests
 import os
 import re
@@ -5,6 +7,9 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+import geopandas as gpd
+import xarray as xr
+from shapely.geometry import Point
 
 
 def show_progress(stage, current, total, extra=''):
@@ -321,6 +326,152 @@ def concatenate_netcdf_files_by_month(local_dir='./downloads', output_dir=None):
         'elapsed_seconds': elapsed,
     }
 
+
+def netcdf_to_geopandas(nc_file: io.BufferedReader | str | os.PathLike, variable_name: str):
+    '''
+    Converte um arquivo NetCDF para um GeoDataFrame do GeoPandas, usando a variável especificada.
+    Parâmetros:
+        - nc_file: Um arquivo NetCDF aberto em modo binário (io.BufferedReader).
+        - variable_name: O nome da variável a ser extraída do arquivo NetCDF.
+    Retorna:
+        - Um GeoDataFrame contendo os dados da variável, com geometria de pontos baseada nas coordenadas lat/lon.
+    '''
+    try:
+
+        # 1. Open the NetCDF file
+        ds = xr.open_dataset(nc_file)
+
+        # 2. Convert to a Pandas DataFrame
+        df = ds[variable_name].to_dataframe().reset_index().dropna(how='any').rename(columns={variable_name: 'temperature'})
+
+        # 3. Create a GeoDataFrame from latitude and longitude columns
+        gdf = gpd.GeoDataFrame(
+            df, 
+            geometry=gpd.points_from_xy(df.lon, df.lat),
+            crs="EPSG:4326"
+        )
+        return gdf
+    except Exception as e:
+        print(f'Erro ao converter NetCDF para GeoDataFrame: {e}')
+        return None
+
+
+def transpond_lon(dataset: xr.DataArray):
+    '''
+    Converte um array 0x360 para -180x180, mudando a convenção de coordenadas de longitude.
+    Parâmetros:
+        - dataset: Um DataArray do xarray representando os dados em formato long.min() lon.max().
+    Retorna:
+        - Um DataArray do xarray com a longitude no formato -180 a 180.
+    '''
+    try:
+        # Verificar se o buffer tem a forma esperada
+        if dataset.lon.min() < 0:
+            print('O buffer já parece estar no formato -180 a 180.')
+            return dataset
+        else:
+            # Transpor o buffer para o formato -180 a 180
+            transposed_ds = dataset.copy()
+            transposed_ds = dataset.assign_coords(lon=(dataset.lon + 180) % 360 - 180)
+            return transposed_ds
+    except Exception as e:
+        print(f'Erro ao transpor longitude: {e}')
+        return dataset
+
+
+def get_vizinho_proximo(gdf: gpd.GeoDataFrame, point: Point):
+    '''
+    Encontra o vizinho mais próximo de um ponto específico em um GeoDataFrame.
+    Parâmetros:
+        - gdf: Um GeoDataFrame do GeoPandas contendo geometria de pontos.
+        - point: Um objeto Point do Shapely representando o ponto de interesse.
+    Retorna:
+        - O índice do vizinho mais próximo no GeoDataFrame, ou None se o GeoDataFrame estiver vazio.
+    '''
+    try:
+        if gdf.empty:
+            print('O GeoDataFrame está vazio. Não é possível encontrar vizinhos.')
+            return None
+
+        # Calcular a distância entre o ponto e cada geometria no GeoDataFrame
+        gdf['distance'] = gdf.geometry.distance(point)
+
+        # Encontrar o índice do vizinho mais próximo
+        nearest_index = gdf['distance'].idxmin()
+
+        # Remover a coluna de distância para limpeza
+        gdf.drop(columns=['distance'], inplace=True)
+
+        return nearest_index
+    except Exception as e:
+        print(f'Erro ao encontrar vizinho mais próximo: {e}')
+        return None
+
+#função que pega os 4 vizinhos mais próximos de um ponto específico de um ponto e retorna o valor da média ponderada pelo inverso da distância desses vizinhos
+def regionalizacao_inversa_distancia(gdf: gpd.GeoDataFrame, point: Point, variable_name: str):
+    '''
+    Realiza a regionalização por inverso da distância para um ponto específico em um GeoDataFrame.
+    Parâmetros:
+        - gdf: Um GeoDataFrame do GeoPandas contendo geometria de pontos e uma variável de interesse.
+        - point: Um objeto Point do Shapely representando o ponto de interesse.
+        - variable_name: O nome da variável no GeoDataFrame para a qual a regionalização será aplicada.
+    Retorna:
+        - O valor regionalizado para o ponto de interesse, ou None se o GeoDataFrame estiver vazio ou se ocorrer um erro.
+    '''
+    try:
+        if gdf.empty:
+            print('O GeoDataFrame está vazio. Não é possível realizar regionalização.')
+            return None
+
+        # Calcular a distância entre o ponto e cada geometria no GeoDataFrame
+        gdf['distance'] = gdf.geometry.distance(point)
+
+        # Selecionar os 4 vizinhos mais próximos
+        nearest_neighbors = gdf.nsmallest(4, 'distance')
+
+        # Calcular a média ponderada pelo inverso da distância
+        nearest_neighbors['weight'] = 1 / nearest_neighbors['distance']
+        weighted_average = (nearest_neighbors[variable_name] * nearest_neighbors['weight']).sum() / nearest_neighbors['weight'].sum()
+
+        # Remover as colunas de distância e peso para limpeza
+        gdf.drop(columns=['distance'], inplace=True)
+        nearest_neighbors.drop(columns=['weight'], inplace=True)
+
+        return weighted_average
+    except Exception as e:
+        print(f'Erro ao realizar regionalização por inverso da distância: {e}')
+        return None
+    
+
+# a função acima recebendo uma lista de pontos e retornando uma lista de valores regionalizados para cada ponto
+def regionalizacao_inversa_distancia_multiplos_pontos(gdf: gpd.GeoDataFrame, points: list[Point], variable_name: str):
+    '''
+    Realiza a regionalização por inverso da distância para uma lista de pontos específicos em um GeoDataFrame.
+    Parâmetros:
+        - gdf: Um GeoDataFrame do GeoPandas contendo geometria de pontos e uma variável de interesse.
+        - points: Uma lista de objetos Point do Shapely representando os pontos de interesse.
+        - variable_name: O nome da variável no GeoDataFrame para a qual a regionalização será aplicada.
+    Retorna:
+        - Uma lista de valores regionalizados para cada ponto de interesse, ou None se o GeoDataFrame estiver vazio ou se ocorrer um erro.
+    '''
+    try:
+        if gdf.empty:
+            print('O GeoDataFrame está vazio. Não é possível realizar regionalização.')
+            return None
+
+        regionalized_values = []
+        for point in points:
+            regionalized_value = regionalizacao_inversa_distancia(gdf, point, variable_name)
+            regionalized_values.append(regionalized_value)
+
+        return regionalized_values
+    except Exception as e:
+        print(f'Erro ao realizar regionalização por inverso da distância para múltiplos pontos: {e}')
+        return None
+    
+
+
+    
 
 def main(start_date=None, end_date=None, local_dir='./SAMeT'):
     print('Iniciando download de dados SAMeT...')
